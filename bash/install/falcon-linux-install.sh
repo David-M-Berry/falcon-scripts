@@ -25,6 +25,7 @@ Optional:
     - FALCON_UNINSTALL                  (default: false)
     - FALCON_INSTALL_ONLY               (default: false)
     - ALLOW_LEGACY_CURL                 (default: false)
+    - FALCON_DOWNLOAD_ONLY              (default: false) 
 EOF
 }
 
@@ -33,13 +34,19 @@ main() {
         print_usage
         exit 1
     fi
+    if [ "${FALCON_DOWNLOAD_ONLY}" = "true" ]; then
+        echo -n 'Downloading Falcon Sensor ... '
+        cs_sensor_download_only
+        echo '[ Ok ]'
+        echo 'Falcon Sensor downloaded successfully.'
+        exit 0
+    fi
     echo -n 'Check if Falcon Sensor is running ... '
     cs_sensor_is_running
     echo '[ Not present ]'
     echo -n 'Falcon Sensor Install  ... '
     cs_sensor_install
     echo '[ Ok ]'
-    # Run if FALCON_INSTALL_ONLY is not set or is set to false
     if [ -z "$FALCON_INSTALL_ONLY" ] || [ "${FALCON_INSTALL_ONLY}" = "false" ]; then
         echo -n 'Falcon Sensor Register ... '
         cs_sensor_register
@@ -56,49 +63,39 @@ cs_sensor_register() {
         die "Could not find FALCON CID!"
     fi
 
-    # add the cid to the params
     cs_falcon_args=--cid="${cs_falcon_cid}"
     if [ -n "${cs_falcon_token}" ]; then
         cs_token=--provisioning-token="${cs_falcon_token}"
         cs_falcon_args="$cs_falcon_args $cs_token"
     fi
-    # add tags to the params
     if [ -n "${FALCON_TAGS}" ]; then
         cs_falconctl_opt_tags=--tags="$FALCON_TAGS"
         cs_falcon_args="$cs_falcon_args $cs_falconctl_opt_tags"
     fi
-    # add proxy enable/disable param
     if [ -n "${cs_falcon_apd}" ]; then
         cs_falconctl_opt_apd=--apd=$cs_falcon_apd
         cs_falcon_args="$cs_falcon_args $cs_falconctl_opt_apd"
     fi
-    # add proxy host to the params
     if [ -n "${FALCON_APH}" ]; then
         cs_falconctl_opt_aph=--aph="${FALCON_APH}"
         cs_falcon_args="$cs_falcon_args $cs_falconctl_opt_aph"
     fi
-    # add proxy port to the params
     if [ -n "${FALCON_APP}" ]; then
         cs_falconctl_opt_app=--app="${FALCON_APP}"
         cs_falcon_args="$cs_falcon_args $cs_falconctl_opt_app"
     fi
-    # add the billing type to the params
     if [ -n "${FALCON_BILLING}" ]; then
         cs_falconctl_opt_billing=--billing="${cs_falcon_billing}"
         cs_falcon_args="$cs_falcon_args $cs_falconctl_opt_billing"
     fi
-    # add the backend to the params
     if [ -n "${cs_falcon_backend}" ]; then
         cs_falconctl_opt_backend=--backend="${cs_falcon_backend}"
         cs_falcon_args="$cs_falcon_args $cs_falconctl_opt_backend"
     fi
-    # add the trace level to the params
     if [ -n "${cs_falcon_trace}" ]; then
         cs_falconctl_opt_trace=--trace="${cs_falcon_trace}"
         cs_falcon_args="$cs_falcon_args $cs_falconctl_opt_trace"
     fi
-    # run the configuration command
-    # shellcheck disable=SC2086
     /opt/CrowdStrike/falconctl -s -f ${cs_falcon_args}
 }
 
@@ -120,6 +117,7 @@ cs_sensor_restart() {
 }
 
 cs_sensor_install() {
+    local tempdir package_name
     tempdir=$(mktemp -d)
 
     tempdir_cleanup() { rm -rf "$tempdir"; }
@@ -131,9 +129,22 @@ cs_sensor_install() {
     tempdir_cleanup
 }
 
+cs_sensor_download_only() {
+    local tempdir package_name
+    tempdir=$(mktemp -d)
+
+    tempdir_cleanup() { rm -rf "$tempdir"; }
+    trap tempdir_cleanup EXIT
+
+    package_name=$(cs_sensor_download "$tempdir")
+    cp "$package_name" .
+
+    tempdir_cleanup
+}
+
 cs_sensor_remove() {
     remove_package() {
-        pkg="$1"
+        local pkg="$1"
 
         if type dnf >/dev/null 2>&1; then
             dnf remove -q -y "$pkg" || rpm -e --nodeps "$pkg"
@@ -152,12 +163,10 @@ cs_sensor_remove() {
 }
 
 cs_sensor_policy_version() {
-    cs_policy_name="$1"
+    local cs_policy_name="$1" sensor_update_policy sensor_update_versions
 
-    sensor_update_policy=$(
-        curl_command -G "https://$(cs_cloud)/policy/combined/sensor-update/v2" \
-            --data-urlencode "filter=platform_name:\"Linux\"+name.raw:\"$cs_policy_name\""
-    )
+    sensor_update_policy=$(curl_command -G "https://$(cs_cloud)/policy/combined/sensor-update/v2" \
+        --data-urlencode "filter=platform_name:\"Linux\"+name.raw:\"$cs_policy_name\"")
 
     handle_curl_error $?
 
@@ -174,7 +183,6 @@ cs_sensor_policy_version() {
 
     oldIFS=$IFS
     IFS=" "
-    # shellcheck disable=SC2086
     set -- $sensor_update_versions
     if [ "$(echo "$sensor_update_versions" | wc -w)" -gt 1 ]; then
         if [ "$cs_os_arch" = "aarch64" ]; then
@@ -189,26 +197,20 @@ cs_sensor_policy_version() {
 }
 
 cs_sensor_download() {
-    destination_dir="$1"
+    local destination_dir="$1" existing_installers sha_list INDEX sha file_type installer
 
     if [ -n "$cs_sensor_policy_name" ]; then
         cs_sensor_version=$(cs_sensor_policy_version "$cs_sensor_policy_name")
         cs_api_version_filter="+version:\"$cs_sensor_version\""
 
-        exit_status=$?
-        if [ $exit_status -ne 0 ]; then
-            exit $exit_status
-        fi
         if [ "$cs_falcon_sensor_version_dec" -gt 0 ]; then
             echo "WARNING: Disabling FALCON_SENSOR_VERSION_DECREMENT because it conflicts with FALCON_SENSOR_UPDATE_POLICY_NAME"
             cs_falcon_sensor_version_dec=0
         fi
     fi
 
-    existing_installers=$(
-        curl_command -G "https://$(cs_cloud)/sensors/combined/installers/v1?sort=version|desc" \
-            --data-urlencode "filter=os:\"$cs_os_name\"+os_version:\"*$cs_os_version*\"$cs_api_version_filter$cs_os_arch_filter"
-    )
+    existing_installers=$(curl_command -G "https://$(cs_cloud)/sensors/combined/installers/v1?sort=version|desc" \
+        --data-urlencode "filter=os:\"$cs_os_name\"+os_version:\"*$cs_os_version*\"$cs_api_version_filter$cs_os_arch_filter")
 
     handle_curl_error $?
 
@@ -223,7 +225,6 @@ cs_sensor_download() {
         die "No sensor found for with OS Name: $cs_os_name"
     fi
 
-    # Set the index accordingly (the json_value expects and index+1 value)
     INDEX=$((cs_falcon_sensor_version_dec + 1))
 
     sha=$(echo "$existing_installers" | json_value "sha256" "$INDEX" |
@@ -243,10 +244,10 @@ cs_sensor_download() {
 }
 
 os_install_package() {
-    pkg="$1"
+    local pkg="$1"
 
     rpm_install_package() {
-        pkg="$1"
+        local pkg="$1"
 
         cs_falcon_gpg_import
 
@@ -260,7 +261,6 @@ os_install_package() {
             rpm -ivh --nodeps "$pkg"
         fi
     }
-    # shellcheck disable=SC2221,SC2222
     case "${os_name}" in
         Amazon | CentOS | Oracle | RHEL | Rocky | AlmaLinux | SLES)
             rpm_install_package "$pkg"
@@ -269,9 +269,8 @@ os_install_package() {
             DEBIAN_FRONTEND=noninteractive apt-get -qq install -y "$pkg" >/dev/null
             ;;
         Ubuntu)
-            # If this is ubuntu 14, we need to use dpkg instead
             if [ "${cs_os_version}" -eq 14 ]; then
-                DEBIAN_FRONTEND=noninteractive dpkg -i "$pkg" >/dev/null 2>&1 || true # ignore dep errors
+                DEBIAN_FRONTEND=noninteractive dpkg -i "$pkg" >/dev/null 2>&1 || true
                 DEBIAN_FRONTEND=noninteractive apt-get -qq install -f -y >/dev/null
             else
                 DEBIAN_FRONTEND=noninteractive apt-get -qq install -y "$pkg" >/dev/null
@@ -287,10 +286,11 @@ aws_ssm_parameter() {
     local param_name="$1"
 
     hmac_sha256() {
-        key="$1"
-        data="$2"
+        local key="$1" data="$2"
         echo -n "$data" | openssl dgst -sha256 -mac HMAC -macopt "$key" | sed 's/^.* //'
     }
+
+    local token api_endpoint iam_role aws_my_region _security_credentials access_key_id access_key_secret security_token datetime date request_data request_data_dgst request_dgst dateKey dateRegionKey dateRegionServiceKey hex_key signature response
 
     token=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
     api_endpoint="AmazonSSM.GetParameters"
@@ -356,6 +356,7 @@ EOF
 }
 
 cs_falcon_gpg_import() {
+    local tempfile
     tempfile=$(mktemp)
     cat >"$tempfile" <<EOF
 -----BEGIN PGP PUBLIC KEY BLOCK-----
@@ -369,7 +370,9 @@ vsvSfLKGUzREf8NGChmqjm7seoPiBVbU3uzALjDlHh1DHpHzk3obm+NEAi/t7+jj
 O33kkU1eGEavx/GfXwWCJd1tM8lCB0lLpvgvYN3q+/EvD/QDE/8cj117Z2U1lKY4
 eT/d8yDJTM5ZerRZLEBH8nh+2Q4hOgyPvawN2x2YbIKVQs55mxLQd07OOB5RDov/
 HG3kyeeRxIW+ObDqZq0w2d0zLhU1tANgEiH886L7jRhLik/ZpkWAqnACDLszcaOh
-sRi1ACUMKTp5w5f/kdIVV1JMCxzkF2fzTPmP9nTxXEyHi2VUkKKQyu5b7sLT4EsL
+sRi1AC
+
+UMKTp5w5f/kdIVV1JMCxzkF2fzTPmP9nTxXEyHi2VUkKKQyu5b7sLT4EsL
 RDffD3Mck95H+ALFdpeRgEmkgJ3xLi5HwPGWKWbEdOLR+pR1MrGVvdoeCwARAQAB
 tElDcm93ZFN0cmlrZSwgSW5jLiAoZmFsY29uLXNlbnNvciBpbnN0YWxsZXIga2V5
 KSA8c3VwcG9ydEBjcm93ZHN0cmlrZS5jb20+iQJSBBMBCAA8FiEEv2Mf1htUcfzg
@@ -418,13 +421,12 @@ EOF
 set -e
 
 json_value() {
-    KEY=$1
-    num=$2
+    local KEY="$1" num="$2"
     awk -F"[,:}]" '{for(i=1;i<=NF;i++){if($i~/'"$KEY"'\042/){print $(i+1)}}}' | tr -d '"' | sed -n "${num}p"
 }
 
 die() {
-    echo "Fatal error: $*" >&2
+    printf "Fatal error: %s\n" "$*" >&2
     exit 1
 }
 
@@ -438,7 +440,6 @@ cs_cloud() {
     esac
 }
 
-# Check if curl is greater or equal to 7.55
 old_curl=$(
     if ! command -v curl >/dev/null 2>&1; then
         die "The 'curl' command is missing. Please install it before continuing. Aborting..."
@@ -447,7 +448,6 @@ old_curl=$(
     version=$(curl --version | head -n 1 | awk '{ print $2 }')
     minimum="7.55"
 
-    # Check if the version is less than the minimum
     if printf "%s\n" "$version" "$minimum" | sort -V -C; then
         echo 0
     else
@@ -455,7 +455,6 @@ old_curl=$(
     fi
 )
 
-# Old curl print warning message
 if [ "$old_curl" -eq 0 ]; then
     if [ "${ALLOW_LEGACY_CURL}" != "true" ]; then
         echo """
@@ -468,7 +467,6 @@ To bypass this warning, set the environment variable ALLOW_LEGACY_CURL=true
     fi
 fi
 
-# Handle error codes returned by curl
 handle_curl_error() {
     if [ "$1" = "28" ]; then
         err_msg="Operation timed out (exit code 28)."
@@ -493,7 +491,6 @@ handle_curl_error() {
 }
 
 curl_command() {
-    # Dash does not support arrays, so we have to pass the args as separate arguments
     set -- "$@"
 
     if [ "$old_curl" -eq 0 ]; then
@@ -503,7 +500,6 @@ curl_command() {
     fi
 }
 
-# shellcheck disable=SC2034
 cs_uninstall=$(
     if [ "$FALCON_UNINSTALL" ]; then
         echo -n 'Removing Falcon Sensor  ... '
@@ -516,7 +512,8 @@ cs_uninstall=$(
 
 os_name=$(
     # returns either: Amazon, Ubuntu, CentOS, RHEL, or SLES
-    # lsb_release is not always present
+    # lsb_release is not always present    
+
     name=$(cat /etc/*release | grep ^NAME= | awk -F'=' '{ print $2 }' | sed "s/\"//g;s/Red Hat.*/RHEL/g;s/ Linux$//g;s/ GNU\/Linux$//g;s/Oracle.*/Oracle/g;s/Amazon.*/Amazon/g")
     if [ -z "$name" ]; then
         if lsb_release -s -i | grep -q ^RedHat; then
@@ -536,7 +533,6 @@ os_version=$(
     version=$(cat /etc/*release | grep VERSION_ID= | awk '{ print $1 }' | awk -F'=' '{ print $2 }' | sed "s/\"//g")
     if [ -z "$version" ]; then
         if type rpm >/dev/null 2>&1; then
-            # older systems may have *release files of different form
             version=$(rpm -qf /etc/redhat-release --queryformat '%{VERSION}' | sed 's/\([[:digit:]]\+\).*/\1/g')
         elif [ -f /etc/debian_version ]; then
             version=$(cat /etc/debian_version)
@@ -552,8 +548,6 @@ os_version=$(
 )
 
 cs_os_name=$(
-    # returns OS name as recognised by CrowdStrike Falcon API
-    # shellcheck disable=SC2221,SC2222
     case "${os_name}" in
         Amazon)
             echo "Amazon Linux"
@@ -599,7 +593,6 @@ cs_os_arch_filter=$(
 
 cs_os_version=$(
     version=$(echo "$os_version" | awk -F'.' '{print $1}')
-    # Check if we are using Amazon Linux 1
     if [ "${os_name}" = "Amazon" ]; then
         if [ "$version" != "2" ] && [ "$version" -le 2018 ]; then
             version="1"
@@ -651,7 +644,6 @@ cs_falcon_cloud=$(
     if [ -n "$FALCON_CLOUD" ]; then
         echo "$FALCON_CLOUD"
     else
-        # Auto-discovery is using us-1 initially
         echo "us-1"
     fi
 )
@@ -681,7 +673,6 @@ cs_falcon_sensor_version_dec=$(
 
 response_headers=$(mktemp)
 
-# shellcheck disable=SC2001
 proxy=$(
     proxy=""
     if [ -n "$FALCON_APH" ]; then
@@ -693,7 +684,8 @@ proxy=$(
     fi
 
     if [ -n "$proxy" ]; then
-        # Remove redundant quotes
+
+
         proxy="$(echo "$proxy" | sed "s/[\'\"]//g")"
         proxy="http://$proxy"
     fi
